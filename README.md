@@ -1,4 +1,4 @@
-# GX10 Inference Proxy
+# vLLM Multi-Model Proxy
 
 A lightweight FastAPI proxy that accepts an uploaded image, resizes it safely,
 forwards it to a vLLM vision model, and returns a single German caption sentence.

@@ -14,7 +14,7 @@ from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadF
 from fastapi.responses import FileResponse, JSONResponse
 from PIL import Image
 
-APP_TITLE = "GX10 Inference Proxy"
+APP_TITLE = "vLLM Multi-Model Proxy"
 
 # -------------------------
 # Config (env-driven)
@@ -33,7 +33,7 @@ JPEG_QUALITY = int(os.getenv("JPEG_QUALITY", "85"))
 
 # Serve resized images locally to vLLM (avoid data: URLs)
 DEFAULT_TMP_BASE = Path("/dev/shm") if Path("/dev/shm").is_dir() else Path(gettempdir())
-DEFAULT_TMP_DIR = DEFAULT_TMP_BASE / "inference-proxy"
+DEFAULT_TMP_DIR = DEFAULT_TMP_BASE / "vllm-multi-model-proxy"
 PROXY_TMP_DIR = Path(os.getenv("PROXY_TMP_DIR", str(DEFAULT_TMP_DIR)))
 PROXY_TMP_DIR.mkdir(parents=True, exist_ok=True)
 PROXY_PUBLIC_BASE = os.getenv("PROXY_PUBLIC_BASE", "http://127.0.0.1:9000")
@@ -59,7 +59,7 @@ TARGET_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 # -------------------------
 # Logging
 # -------------------------
-logger = logging.getLogger("inference-proxy")
+logger = logging.getLogger("vllm-multi-model-proxy")
 if not logger.handlers:
     handler = logging.StreamHandler()
     formatter = logging.Formatter(
