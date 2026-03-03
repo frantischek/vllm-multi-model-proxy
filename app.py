@@ -279,7 +279,7 @@ def _resize_and_write_jpeg(raw: bytes, image_id: str) -> Tuple[Path, int, int]:
         w, h = img.size
 
     out_path = (PROXY_TMP_DIR / f"{image_id}.jpg").resolve()
-    if not str(out_path).startswith(str(PROXY_TMP_DIR.resolve())):
+    if not out_path.is_relative_to(PROXY_TMP_DIR.resolve()):
         raise HTTPException(status_code=400, detail="Invalid image id")
     # IMPORTANT: keep JPEG simple (no optimize=True) for max compatibility
     img.save(out_path, format="JPEG", quality=JPEG_QUALITY)
@@ -474,7 +474,7 @@ async def get_tmp_image(request: Request, rid: str):
         raise HTTPException(status_code=404, detail="Not found")
 
     p = (PROXY_TMP_DIR / f"{rid}.jpg").resolve()
-    if not str(p).startswith(str(PROXY_TMP_DIR.resolve())):
+    if not p.is_relative_to(PROXY_TMP_DIR.resolve()):
         raise HTTPException(status_code=403, detail="Forbidden")
     if not p.exists():
         raise HTTPException(status_code=404, detail="Not found")

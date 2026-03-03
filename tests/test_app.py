@@ -1,3 +1,4 @@
+import io as _io
 import re
 import sys
 from pathlib import Path
@@ -6,6 +7,7 @@ from unittest.mock import MagicMock
 import httpx
 import pytest
 from fastapi.testclient import TestClient
+from PIL import Image as _Image
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
@@ -276,9 +278,6 @@ def test_resize_write_jpeg_path_stays_in_tmp(monkeypatch, tmp_path):
     """_resize_and_write_jpeg must write files only within PROXY_TMP_DIR."""
     monkeypatch.setattr(module, "PROXY_TMP_DIR", tmp_path)
     # A safe image_id should work fine
-    import io as _io
-    from PIL import Image as _Image
-
     img = _Image.new("RGB", (10, 10), color="red")
     buf = _io.BytesIO()
     img.save(buf, format="JPEG")
