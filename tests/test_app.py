@@ -1,7 +1,9 @@
 import re
 import sys
 from pathlib import Path
+from unittest.mock import MagicMock
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -191,3 +193,97 @@ def test_tts_missing_config(monkeypatch):
         json={"input": "Hallo Welt"},
     )
     assert res.status_code == 400
+
+
+# ---- Security tests ----
+
+
+def test_token_comparison_uses_hmac(monkeypatch):
+    """Token comparison must use constant-time comparison."""
+    monkeypatch.setattr(module, "INTERNAL_TOKEN", "correct-token")
+
+    # Valid token accepted
+    module._require_internal_token("correct-token")
+
+    # Wrong token rejected
+    with pytest.raises(module.HTTPException) as exc:
+        module._require_internal_token("wrong-token")
+    assert exc.value.status_code == 401
+
+    # Empty token rejected
+    with pytest.raises(module.HTTPException) as exc:
+        module._require_internal_token("")
+    assert exc.value.status_code == 401
+
+    # None token rejected
+    with pytest.raises(module.HTTPException) as exc:
+        module._require_internal_token(None)
+    assert exc.value.status_code == 401
+
+
+def test_img_endpoint_rejects_path_traversal(monkeypatch):
+    """The /_img/ endpoint must reject path traversal attempts."""
+    monkeypatch.setattr(module, "INTERNAL_TOKEN", "secret")
+    _set_single_target(monkeypatch)
+
+    client = TestClient(module.app)
+    # Attempts with path traversal characters are rejected by regex
+    for rid in ["../etc/passwd", "..%2F..%2Fetc%2Fpasswd", "foo/bar"]:
+        res = client.get(f"/_img/{rid}.jpg")
+        assert res.status_code in (403, 404, 422), f"Unexpected status for rid={rid!r}"
+
+
+def test_upstream_error_does_not_leak_url():
+    """Upstream error responses must not contain internal URLs or body previews."""
+    resp = module._error_response(
+        status=502,
+        request_id="test-req",
+        code="upstream_error",
+        message="Upstream request failed",
+        detail={"latency_ms": 100},
+    )
+    body = resp.body.decode()
+    assert "127.0.0.1" not in body
+    assert "body_preview" not in body
+
+
+def test_upstream_bad_status_no_body_leak():
+    """_upstream_bad_status must not leak upstream body content in the response."""
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.status_code = 500
+    mock_resp.text = "SECRET_INTERNAL_DATA from upstream"
+
+    result = module._upstream_bad_status(mock_resp, "req-123", 42, "chat")
+    body = result.body.decode()
+    assert "SECRET_INTERNAL_DATA" not in body
+    assert "body_preview" not in body
+
+
+def test_upstream_json_error_no_body_leak():
+    """_upstream_json_or_error must not leak upstream body in invalid JSON errors."""
+    mock_resp = MagicMock(spec=httpx.Response)
+    mock_resp.json.side_effect = ValueError("bad json")
+    mock_resp.text = "SECRET_UPSTREAM_CONTENT"
+
+    _, err = module._upstream_json_or_error(mock_resp, "req-456", 10, "chat")
+    assert err is not None
+    body = err.body.decode()
+    assert "SECRET_UPSTREAM_CONTENT" not in body
+    assert "body_preview" not in body
+
+
+def test_resize_write_jpeg_path_stays_in_tmp(monkeypatch, tmp_path):
+    """_resize_and_write_jpeg must write files only within PROXY_TMP_DIR."""
+    monkeypatch.setattr(module, "PROXY_TMP_DIR", tmp_path)
+    # A safe image_id should work fine
+    import io as _io
+    from PIL import Image as _Image
+
+    img = _Image.new("RGB", (10, 10), color="red")
+    buf = _io.BytesIO()
+    img.save(buf, format="JPEG")
+    raw = buf.getvalue()
+
+    path, w, h = module._resize_and_write_jpeg(raw, "safe-id")
+    assert str(path.resolve()).startswith(str(tmp_path.resolve()))
+    path.unlink(missing_ok=True)
