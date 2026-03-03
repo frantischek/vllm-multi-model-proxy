@@ -1,3 +1,4 @@
+import hmac
 import io
 import json
 import logging
@@ -133,7 +134,7 @@ async def log_requests(request: Request, call_next):
 def _require_internal_token(token: Optional[str]) -> None:
     if not INTERNAL_TOKEN:
         raise HTTPException(status_code=500, detail="Server is misconfigured")
-    if not token or token != INTERNAL_TOKEN:
+    if not token or not hmac.compare_digest(token, INTERNAL_TOKEN):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
@@ -277,7 +278,9 @@ def _resize_and_write_jpeg(raw: bytes, image_id: str) -> Tuple[Path, int, int]:
         img = img.resize((nw, nh), Image.Resampling.LANCZOS)
         w, h = img.size
 
-    out_path = PROXY_TMP_DIR / f"{image_id}.jpg"
+    out_path = (PROXY_TMP_DIR / f"{image_id}.jpg").resolve()
+    if not out_path.is_relative_to(PROXY_TMP_DIR.resolve()):
+        raise HTTPException(status_code=400, detail="Invalid image id")
     # IMPORTANT: keep JPEG simple (no optimize=True) for max compatibility
     img.save(out_path, format="JPEG", quality=JPEG_QUALITY)
 
@@ -314,7 +317,7 @@ async def _call_upstream(
             resp = await client.post(url, json=payload, headers={"X-Request-Id": request_id})
     except httpx.TimeoutException:
         dt_ms = int((time.time() - t0) * 1000)
-        logger.warning("upstream timeout", extra={"request_id": request_id})
+        logger.warning(f"upstream timeout url={url}", extra={"request_id": request_id})
         return (
             None,
             dt_ms,
@@ -323,12 +326,12 @@ async def _call_upstream(
                 request_id=request_id,
                 code="upstream_timeout",
                 message="Upstream request timed out",
-                detail={"latency_ms": dt_ms, "url": url},
+                detail={"latency_ms": dt_ms},
             ),
         )
     except Exception as e:
         dt_ms = int((time.time() - t0) * 1000)
-        logger.exception("upstream error", extra={"request_id": request_id})
+        logger.exception(f"upstream error url={url}", extra={"request_id": request_id})
         return (
             None,
             dt_ms,
@@ -337,7 +340,7 @@ async def _call_upstream(
                 request_id=request_id,
                 code="upstream_error",
                 message="Upstream request failed",
-                detail={"exception": str(e), "latency_ms": dt_ms, "url": url},
+                detail={"latency_ms": dt_ms},
             ),
         )
 
@@ -346,6 +349,10 @@ async def _call_upstream(
 
 
 def _upstream_bad_status(resp: httpx.Response, request_id: str, dt_ms: int, task: str) -> JSONResponse:
+    logger.warning(
+        f"upstream bad status task={task} status={resp.status_code} body={resp.text[:2000]}",
+        extra={"request_id": request_id},
+    )
     return _error_response(
         status=502,
         request_id=request_id,
@@ -353,7 +360,6 @@ def _upstream_bad_status(resp: httpx.Response, request_id: str, dt_ms: int, task
         message=f"{task} upstream returned an error",
         detail={
             "upstream_status": resp.status_code,
-            "body_preview": resp.text[:2000],
             "latency_ms": dt_ms,
         },
     )
@@ -365,12 +371,16 @@ def _upstream_json_or_error(
     try:
         body = resp.json()
     except Exception:
+        logger.warning(
+            f"upstream invalid JSON body={resp.text[:2000]}",
+            extra={"request_id": request_id},
+        )
         return None, _error_response(
             status=502,
             request_id=request_id,
             code="upstream_invalid_json",
             message=f"{task} upstream returned invalid JSON",
-            detail={"latency_ms": dt_ms, "body_preview": resp.text[:2000]},
+            detail={"latency_ms": dt_ms},
         )
     if not isinstance(body, dict):
         return None, _error_response(
@@ -463,7 +473,9 @@ async def get_tmp_image(request: Request, rid: str):
     if not SAFE_ID_FULL_RE.fullmatch(rid):
         raise HTTPException(status_code=404, detail="Not found")
 
-    p = PROXY_TMP_DIR / f"{rid}.jpg"
+    p = (PROXY_TMP_DIR / f"{rid}.jpg").resolve()
+    if not p.is_relative_to(PROXY_TMP_DIR.resolve()):
+        raise HTTPException(status_code=403, detail="Forbidden")
     if not p.exists():
         raise HTTPException(status_code=404, detail="Not found")
 
@@ -537,13 +549,16 @@ async def caption(
         try:
             caption_text = body["choices"][0]["message"]["content"].strip()
         except Exception:
-            logger.warning("bad caption response shape", extra={"request_id": request_id})
+            logger.warning(
+                f"bad caption response shape body={json.dumps(body)[:2000]}",
+                extra={"request_id": request_id},
+            )
             return _error_response(
                 status=502,
                 request_id=request_id,
                 code="bad_model_response",
                 message="Unexpected caption response format",
-                detail={"latency_ms": dt_ms, "body_preview": json.dumps(body)[:2000]},
+                detail={"latency_ms": dt_ms},
             )
 
         logger.info(
