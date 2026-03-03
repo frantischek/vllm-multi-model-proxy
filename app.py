@@ -7,12 +7,13 @@ import time
 import uuid
 from pathlib import Path
 from tempfile import gettempdir
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, Response
 from PIL import Image
+from pydantic import BaseModel
 
 APP_TITLE = "vLLM Multi-Model Proxy"
 
@@ -20,8 +21,20 @@ APP_TITLE = "vLLM Multi-Model Proxy"
 # Config (env-driven)
 # -------------------------
 INTERNAL_TOKEN = os.getenv("INTERNAL_TOKEN", "")
+
+# Backward-compatible defaults
 VLLM_URL = os.getenv("VLLM_URL", "http://127.0.0.1:8000/v1/chat/completions")
 VLLM_MODEL = os.getenv("VLLM_MODEL", "Qwen/Qwen2.5-VL-7B-Instruct")
+
+# Optional task-specific defaults (single-target mode)
+VLLM_CHAT_URL = os.getenv("VLLM_CHAT_URL", VLLM_URL)
+VLLM_CHAT_MODEL = os.getenv("VLLM_CHAT_MODEL", VLLM_MODEL)
+VLLM_CAPTION_MODEL = os.getenv("VLLM_CAPTION_MODEL", VLLM_CHAT_MODEL)
+VLLM_IMAGE_URL = os.getenv("VLLM_IMAGE_URL", "")
+VLLM_IMAGE_MODEL = os.getenv("VLLM_IMAGE_MODEL", VLLM_CHAT_MODEL)
+VLLM_TTS_URL = os.getenv("VLLM_TTS_URL", "")
+VLLM_TTS_MODEL = os.getenv("VLLM_TTS_MODEL", VLLM_CHAT_MODEL)
+
 VLLM_TARGETS_JSON = os.getenv("VLLM_TARGETS_JSON", "")
 VLLM_DEFAULT_TARGET = os.getenv("VLLM_DEFAULT_TARGET", "").strip()
 
@@ -56,6 +69,33 @@ SAFE_ID_RE = re.compile(r"[^A-Za-z0-9_-]+")
 SAFE_ID_FULL_RE = re.compile(r"^[A-Za-z0-9_-]{1,96}$")
 TARGET_ALIAS_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
 
+
+class ChatRequest(BaseModel):
+    messages: list[Dict[str, Any]]
+    target: Optional[str] = None
+    system_prompt: Optional[str] = None
+    temperature: Optional[float] = None
+    max_tokens: Optional[int] = None
+    stream: bool = False
+
+
+class ImageGenerateRequest(BaseModel):
+    prompt: str
+    target: Optional[str] = None
+    n: Optional[int] = None
+    size: Optional[str] = None
+    quality: Optional[str] = None
+    response_format: Optional[str] = None
+
+
+class TTSRequest(BaseModel):
+    input: str
+    target: Optional[str] = None
+    voice: Optional[str] = None
+    response_format: Optional[str] = None
+    speed: Optional[float] = None
+
+
 # -------------------------
 # Logging
 # -------------------------
@@ -75,6 +115,7 @@ logger.propagate = False
 # -------------------------
 app = FastAPI(title=APP_TITLE)
 
+
 @app.middleware("http")
 async def log_requests(request: Request, call_next):
     rid = _get_request_id(request.headers.get("x-request-id"))
@@ -88,6 +129,7 @@ async def log_requests(request: Request, call_next):
     )
     return resp
 
+
 def _require_internal_token(token: Optional[str]) -> None:
     if not INTERNAL_TOKEN:
         raise HTTPException(status_code=500, detail="Server is misconfigured")
@@ -95,10 +137,55 @@ def _require_internal_token(token: Optional[str]) -> None:
         raise HTTPException(status_code=401, detail="Unauthorized")
 
 
-def _parse_vllm_targets(raw_json: str, fallback_url: str, fallback_model: str) -> Dict[str, Dict[str, str]]:
+def _normalize_target_config(alias: str, cfg: Dict[str, Any]) -> Dict[str, str]:
+    legacy_url = cfg.get("url")
+    legacy_model = cfg.get("model")
+
+    chat_url = cfg.get("chat_url", legacy_url if legacy_url is not None else VLLM_CHAT_URL)
+    chat_model = cfg.get("chat_model", legacy_model if legacy_model is not None else VLLM_CHAT_MODEL)
+    caption_model = cfg.get("caption_model", chat_model)
+
+    image_url = cfg.get("image_url", VLLM_IMAGE_URL)
+    image_model = cfg.get("image_model", VLLM_IMAGE_MODEL or chat_model)
+    tts_url = cfg.get("tts_url", VLLM_TTS_URL)
+    tts_model = cfg.get("tts_model", VLLM_TTS_MODEL or chat_model)
+
+    if not isinstance(chat_url, str) or not chat_url.strip():
+        raise RuntimeError(f"Target '{alias}' has invalid or empty 'chat_url'")
+    if not isinstance(chat_model, str) or not chat_model.strip():
+        raise RuntimeError(f"Target '{alias}' has invalid or empty 'chat_model'")
+    if not isinstance(caption_model, str) or not caption_model.strip():
+        raise RuntimeError(f"Target '{alias}' has invalid or empty 'caption_model'")
+
+    if image_url is None:
+        image_url = ""
+    if not isinstance(image_url, str):
+        raise RuntimeError(f"Target '{alias}' has invalid 'image_url'")
+    if not isinstance(image_model, str) or not image_model.strip():
+        raise RuntimeError(f"Target '{alias}' has invalid or empty 'image_model'")
+
+    if tts_url is None:
+        tts_url = ""
+    if not isinstance(tts_url, str):
+        raise RuntimeError(f"Target '{alias}' has invalid 'tts_url'")
+    if not isinstance(tts_model, str) or not tts_model.strip():
+        raise RuntimeError(f"Target '{alias}' has invalid or empty 'tts_model'")
+
+    return {
+        "chat_url": chat_url.strip(),
+        "chat_model": chat_model.strip(),
+        "caption_model": caption_model.strip(),
+        "image_url": image_url.strip(),
+        "image_model": image_model.strip(),
+        "tts_url": tts_url.strip(),
+        "tts_model": tts_model.strip(),
+    }
+
+
+def _parse_vllm_targets(raw_json: str) -> Dict[str, Dict[str, str]]:
     raw = (raw_json or "").strip()
     if not raw:
-        return {"default": {"url": fallback_url, "model": fallback_model}}
+        return {"default": _normalize_target_config("default", {})}
 
     try:
         parsed = json.loads(raw)
@@ -113,16 +200,10 @@ def _parse_vllm_targets(raw_json: str, fallback_url: str, fallback_model: str) -
         if not isinstance(alias, str) or not TARGET_ALIAS_RE.fullmatch(alias):
             raise RuntimeError(f"Invalid target alias: {alias!r}")
         if not isinstance(cfg, dict):
-            raise RuntimeError(f"Target '{alias}' must be an object with 'url' and 'model'")
-
-        url = cfg.get("url")
-        model = cfg.get("model")
-        if not isinstance(url, str) or not url.strip():
-            raise RuntimeError(f"Target '{alias}' has invalid or empty 'url'")
-        if not isinstance(model, str) or not model.strip():
-            raise RuntimeError(f"Target '{alias}' has invalid or empty 'model'")
-
-        targets[alias] = {"url": url.strip(), "model": model.strip()}
+            raise RuntimeError(
+                f"Target '{alias}' must be an object with chat_* / image_* / tts_* fields"
+            )
+        targets[alias] = _normalize_target_config(alias, cfg)
 
     return targets
 
@@ -137,7 +218,7 @@ def _resolve_default_target_alias(targets: Dict[str, Dict[str, str]], configured
     return next(iter(targets))
 
 
-VLLM_TARGETS = _parse_vllm_targets(VLLM_TARGETS_JSON, VLLM_URL, VLLM_MODEL)
+VLLM_TARGETS = _parse_vllm_targets(VLLM_TARGETS_JSON)
 DEFAULT_VLLM_TARGET = _resolve_default_target_alias(VLLM_TARGETS, VLLM_DEFAULT_TARGET)
 
 
@@ -157,7 +238,7 @@ def _new_image_id(request_id: str) -> str:
     return _sanitize_identifier(f"{request_id}-{suffix}", fallback=uuid.uuid4().hex, max_len=96)
 
 
-def _resolve_vllm_target(requested_target: Optional[str]) -> Tuple[str, str, str]:
+def _resolve_vllm_target(requested_target: Optional[str]) -> Tuple[str, Dict[str, str]]:
     alias = (requested_target or "").strip()
     if not alias:
         alias = DEFAULT_VLLM_TARGET
@@ -170,8 +251,7 @@ def _resolve_vllm_target(requested_target: Optional[str]) -> Tuple[str, str, str
                 "available_targets": sorted(VLLM_TARGETS.keys()),
             },
         )
-    target_cfg = VLLM_TARGETS[alias]
-    return alias, target_cfg["url"], target_cfg["model"]
+    return alias, VLLM_TARGETS[alias]
 
 
 async def _read_limited(upload: UploadFile) -> bytes:
@@ -225,6 +305,84 @@ def _error_response(status: int, request_id: str, code: str, message: str, detai
     return JSONResponse(status_code=status, content=body)
 
 
+async def _call_upstream(
+    url: str, payload: Dict[str, Any], request_id: str
+) -> Tuple[Optional[httpx.Response], int, Optional[JSONResponse]]:
+    t0 = time.time()
+    try:
+        async with httpx.AsyncClient(timeout=VLLM_TIMEOUT_S) as client:
+            resp = await client.post(url, json=payload, headers={"X-Request-Id": request_id})
+    except httpx.TimeoutException:
+        dt_ms = int((time.time() - t0) * 1000)
+        logger.warning("upstream timeout", extra={"request_id": request_id})
+        return (
+            None,
+            dt_ms,
+            _error_response(
+                status=504,
+                request_id=request_id,
+                code="upstream_timeout",
+                message="Upstream request timed out",
+                detail={"latency_ms": dt_ms, "url": url},
+            ),
+        )
+    except Exception as e:
+        dt_ms = int((time.time() - t0) * 1000)
+        logger.exception("upstream error", extra={"request_id": request_id})
+        return (
+            None,
+            dt_ms,
+            _error_response(
+                status=502,
+                request_id=request_id,
+                code="upstream_error",
+                message="Upstream request failed",
+                detail={"exception": str(e), "latency_ms": dt_ms, "url": url},
+            ),
+        )
+
+    dt_ms = int((time.time() - t0) * 1000)
+    return resp, dt_ms, None
+
+
+def _upstream_bad_status(resp: httpx.Response, request_id: str, dt_ms: int, task: str) -> JSONResponse:
+    return _error_response(
+        status=502,
+        request_id=request_id,
+        code="upstream_bad_response",
+        message=f"{task} upstream returned an error",
+        detail={
+            "upstream_status": resp.status_code,
+            "body_preview": resp.text[:2000],
+            "latency_ms": dt_ms,
+        },
+    )
+
+
+def _upstream_json_or_error(
+    resp: httpx.Response, request_id: str, dt_ms: int, task: str
+) -> Tuple[Optional[Dict[str, Any]], Optional[JSONResponse]]:
+    try:
+        body = resp.json()
+    except Exception:
+        return None, _error_response(
+            status=502,
+            request_id=request_id,
+            code="upstream_invalid_json",
+            message=f"{task} upstream returned invalid JSON",
+            detail={"latency_ms": dt_ms, "body_preview": resp.text[:2000]},
+        )
+    if not isinstance(body, dict):
+        return None, _error_response(
+            status=502,
+            request_id=request_id,
+            code="upstream_invalid_json_shape",
+            message=f"{task} upstream JSON must be an object",
+            detail={"latency_ms": dt_ms},
+        )
+    return body, None
+
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     request_id = getattr(request.state, "request_id", uuid.uuid4().hex)
@@ -259,6 +417,7 @@ async def health():
         "service": APP_TITLE,
         "default_target": DEFAULT_VLLM_TARGET,
         "target_count": len(VLLM_TARGETS),
+        "capabilities": ["caption", "chat", "image_generate", "tts"],
     }
 
 
@@ -274,7 +433,22 @@ async def list_models(
         "request_id": request_id,
         "default_target": DEFAULT_VLLM_TARGET,
         "targets": [
-            {"alias": alias, "model": cfg["model"], "url": cfg["url"]}
+            {
+                "alias": alias,
+                "chat_model": cfg["chat_model"],
+                "caption_model": cfg["caption_model"],
+                "image_model": cfg["image_model"],
+                "tts_model": cfg["tts_model"],
+                "chat_url": cfg["chat_url"],
+                "image_url": cfg["image_url"],
+                "tts_url": cfg["tts_url"],
+                "capabilities": {
+                    "caption": True,
+                    "chat": True,
+                    "image_generate": bool(cfg["image_url"]),
+                    "tts": bool(cfg["tts_url"]),
+                },
+            }
             for alias, cfg in sorted(VLLM_TARGETS.items())
         ],
     }
@@ -313,14 +487,13 @@ async def caption(
     request.state.request_id = request_id
 
     _require_internal_token(x_internal_token)
-
     client_ip = request.client.host if request.client else "unknown"
 
     if image.content_type not in ALLOWED_MIME:
         raise HTTPException(status_code=415, detail=f"Unsupported image type: {image.content_type}")
 
     requested_target = target if target is not None else x_vllm_target
-    target_alias, target_url, target_model = _resolve_vllm_target(requested_target)
+    target_alias, target_cfg = _resolve_vllm_target(requested_target)
 
     raw = await _read_limited(image)
 
@@ -331,7 +504,7 @@ async def caption(
     image_url = f"{PROXY_PUBLIC_BASE.rstrip('/')}/_img/{image_id}.jpg"
 
     payload = {
-        "model": target_model,
+        "model": target_cfg["caption_model"],
         "messages": [
             {
                 "role": "user",
@@ -345,85 +518,267 @@ async def caption(
         "max_tokens": VLLM_MAX_TOKENS,
     }
 
-    t0 = time.time()
     try:
-        try:
-            async with httpx.AsyncClient(timeout=VLLM_TIMEOUT_S) as client:
-                resp = await client.post(target_url, json=payload, headers={"X-Request-Id": request_id})
-        except httpx.TimeoutException:
-            dt_ms = int((time.time() - t0) * 1000)
-            logger.warning("vllm timeout", extra={"request_id": request_id})
-            return _error_response(
-                status=504,
-                request_id=request_id,
-                code="upstream_timeout",
-                message="vLLM request timed out",
-                detail={"latency_ms": dt_ms},
-            )
-        except Exception as e:
-            dt_ms = int((time.time() - t0) * 1000)
-            logger.exception("upstream error", extra={"request_id": request_id})
-            return _error_response(
-                status=502,
-                request_id=request_id,
-                code="upstream_error",
-                message="vLLM request failed",
-                detail={"exception": str(e), "latency_ms": dt_ms},
-            )
-
-        dt_ms = int((time.time() - t0) * 1000)
+        resp, dt_ms, err = await _call_upstream(target_cfg["chat_url"], payload, request_id)
+        if err is not None:
+            return err
+        if resp is None:
+            return _error_response(502, request_id, "upstream_error", "Unexpected upstream state")
 
         if resp.status_code != 200:
-            body_preview = resp.text[:2000]
-            logger.warning(f"vllm non-200 status={resp.status_code}", extra={"request_id": request_id})
-            return _error_response(
-                status=502,
-                request_id=request_id,
-                code="upstream_bad_response",
-                message="vLLM returned an error",
-                detail={
-                    "vllm_status": resp.status_code,
-                    "body_preview": body_preview,
-                    "latency_ms": dt_ms,
-                },
-            )
+            return _upstream_bad_status(resp, request_id, dt_ms, "caption")
+
+        body, parse_err = _upstream_json_or_error(resp, request_id, dt_ms, "caption")
+        if parse_err is not None:
+            return parse_err
+        if body is None:
+            return _error_response(502, request_id, "upstream_invalid_json", "Missing body")
 
         try:
-            j = resp.json()
+            caption_text = body["choices"][0]["message"]["content"].strip()
         except Exception:
-            logger.warning("vllm invalid json", extra={"request_id": request_id})
-            return _error_response(
-                status=502,
-                request_id=request_id,
-                code="upstream_invalid_json",
-                message="vLLM returned invalid JSON",
-                detail={"latency_ms": dt_ms, "body_preview": resp.text[:2000]},
-            )
-
-        try:
-            caption_text = j["choices"][0]["message"]["content"].strip()
-        except Exception:
-            logger.warning("bad model response shape", extra={"request_id": request_id})
+            logger.warning("bad caption response shape", extra={"request_id": request_id})
             return _error_response(
                 status=502,
                 request_id=request_id,
                 code="bad_model_response",
-                message="Unexpected vLLM response format",
-                detail={"latency_ms": dt_ms, "body_preview": json.dumps(j)[:2000]},
+                message="Unexpected caption response format",
+                detail={"latency_ms": dt_ms, "body_preview": json.dumps(body)[:2000]},
             )
 
         logger.info(
-            f"ok status=200 latency_ms={dt_ms} client_ip={client_ip} target={target_alias} resized={w}x{h}",
+            f"ok task=caption status=200 latency_ms={dt_ms} client_ip={client_ip} target={target_alias} resized={w}x{h}",
             extra={"request_id": request_id},
         )
 
         return {
             "request_id": request_id,
+            "task": "caption",
+            "target": target_alias,
+            "model": target_cfg["caption_model"],
             "caption": caption_text,
             "latency_ms": dt_ms,
-            "target": target_alias,
-            "model": target_model,
             "image_after_resize": {"width": w, "height": h, "max_edge": MAX_RESIZE},
         }
     finally:
         _cleanup_tmp_image(image_path, request_id)
+
+
+@app.post("/internal/chat")
+async def chat(
+    request: Request,
+    payload: ChatRequest,
+    x_internal_token: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None),
+    x_vllm_target: Optional[str] = Header(default=None),
+):
+    request_id = _sanitize_identifier(
+        x_request_id or getattr(request.state, "request_id", ""),
+        fallback=uuid.uuid4().hex,
+        max_len=64,
+    )
+    request.state.request_id = request_id
+    _require_internal_token(x_internal_token)
+
+    if payload.stream:
+        raise HTTPException(status_code=400, detail="Streaming is not supported by this proxy endpoint")
+    if not payload.messages:
+        raise HTTPException(status_code=422, detail="messages must not be empty")
+
+    requested_target = payload.target if payload.target is not None else x_vllm_target
+    target_alias, target_cfg = _resolve_vllm_target(requested_target)
+
+    messages = list(payload.messages)
+    if payload.system_prompt:
+        messages = [{"role": "system", "content": payload.system_prompt}] + messages
+
+    upstream_payload: Dict[str, Any] = {
+        "model": target_cfg["chat_model"],
+        "messages": messages,
+        "stream": False,
+        "temperature": payload.temperature if payload.temperature is not None else VLLM_TEMPERATURE,
+        "max_tokens": payload.max_tokens if payload.max_tokens is not None else VLLM_MAX_TOKENS,
+    }
+
+    resp, dt_ms, err = await _call_upstream(target_cfg["chat_url"], upstream_payload, request_id)
+    if err is not None:
+        return err
+    if resp is None:
+        return _error_response(502, request_id, "upstream_error", "Unexpected upstream state")
+
+    if resp.status_code != 200:
+        return _upstream_bad_status(resp, request_id, dt_ms, "chat")
+
+    body, parse_err = _upstream_json_or_error(resp, request_id, dt_ms, "chat")
+    if parse_err is not None:
+        return parse_err
+    if body is None:
+        return _error_response(502, request_id, "upstream_invalid_json", "Missing body")
+
+    text_preview = None
+    try:
+        text_preview = body["choices"][0]["message"]["content"]
+    except Exception:
+        text_preview = None
+
+    logger.info(
+        f"ok task=chat status=200 latency_ms={dt_ms} target={target_alias}",
+        extra={"request_id": request_id},
+    )
+
+    return {
+        "request_id": request_id,
+        "task": "chat",
+        "target": target_alias,
+        "model": target_cfg["chat_model"],
+        "latency_ms": dt_ms,
+        "text": text_preview,
+        "result": body,
+    }
+
+
+@app.post("/internal/image-generate")
+async def image_generate(
+    request: Request,
+    payload: ImageGenerateRequest,
+    x_internal_token: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None),
+    x_vllm_target: Optional[str] = Header(default=None),
+):
+    request_id = _sanitize_identifier(
+        x_request_id or getattr(request.state, "request_id", ""),
+        fallback=uuid.uuid4().hex,
+        max_len=64,
+    )
+    request.state.request_id = request_id
+    _require_internal_token(x_internal_token)
+
+    requested_target = payload.target if payload.target is not None else x_vllm_target
+    target_alias, target_cfg = _resolve_vllm_target(requested_target)
+
+    if not target_cfg["image_url"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Target '{target_alias}' does not have image generation configured (missing image_url)",
+        )
+
+    upstream_payload: Dict[str, Any] = {
+        "model": target_cfg["image_model"],
+        "prompt": payload.prompt,
+    }
+    if payload.n is not None:
+        upstream_payload["n"] = payload.n
+    if payload.size is not None:
+        upstream_payload["size"] = payload.size
+    if payload.quality is not None:
+        upstream_payload["quality"] = payload.quality
+    if payload.response_format is not None:
+        upstream_payload["response_format"] = payload.response_format
+
+    resp, dt_ms, err = await _call_upstream(target_cfg["image_url"], upstream_payload, request_id)
+    if err is not None:
+        return err
+    if resp is None:
+        return _error_response(502, request_id, "upstream_error", "Unexpected upstream state")
+
+    if resp.status_code != 200:
+        return _upstream_bad_status(resp, request_id, dt_ms, "image_generate")
+
+    body, parse_err = _upstream_json_or_error(resp, request_id, dt_ms, "image_generate")
+    if parse_err is not None:
+        return parse_err
+    if body is None:
+        return _error_response(502, request_id, "upstream_invalid_json", "Missing body")
+
+    logger.info(
+        f"ok task=image_generate status=200 latency_ms={dt_ms} target={target_alias}",
+        extra={"request_id": request_id},
+    )
+
+    return {
+        "request_id": request_id,
+        "task": "image_generate",
+        "target": target_alias,
+        "model": target_cfg["image_model"],
+        "latency_ms": dt_ms,
+        "result": body,
+    }
+
+
+@app.post("/internal/tts")
+async def tts(
+    request: Request,
+    payload: TTSRequest,
+    x_internal_token: Optional[str] = Header(default=None),
+    x_request_id: Optional[str] = Header(default=None),
+    x_vllm_target: Optional[str] = Header(default=None),
+):
+    request_id = _sanitize_identifier(
+        x_request_id or getattr(request.state, "request_id", ""),
+        fallback=uuid.uuid4().hex,
+        max_len=64,
+    )
+    request.state.request_id = request_id
+    _require_internal_token(x_internal_token)
+
+    requested_target = payload.target if payload.target is not None else x_vllm_target
+    target_alias, target_cfg = _resolve_vllm_target(requested_target)
+
+    if not target_cfg["tts_url"]:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Target '{target_alias}' does not have TTS configured (missing tts_url)",
+        )
+
+    upstream_payload: Dict[str, Any] = {
+        "model": target_cfg["tts_model"],
+        "input": payload.input,
+    }
+    if payload.voice is not None:
+        upstream_payload["voice"] = payload.voice
+    if payload.response_format is not None:
+        upstream_payload["response_format"] = payload.response_format
+    if payload.speed is not None:
+        upstream_payload["speed"] = payload.speed
+
+    resp, dt_ms, err = await _call_upstream(target_cfg["tts_url"], upstream_payload, request_id)
+    if err is not None:
+        return err
+    if resp is None:
+        return _error_response(502, request_id, "upstream_error", "Unexpected upstream state")
+
+    if resp.status_code != 200:
+        return _upstream_bad_status(resp, request_id, dt_ms, "tts")
+
+    content_type = (resp.headers.get("content-type") or "").lower()
+
+    logger.info(
+        f"ok task=tts status=200 latency_ms={dt_ms} target={target_alias}",
+        extra={"request_id": request_id},
+    )
+
+    if "application/json" in content_type:
+        body, parse_err = _upstream_json_or_error(resp, request_id, dt_ms, "tts")
+        if parse_err is not None:
+            return parse_err
+        if body is None:
+            return _error_response(502, request_id, "upstream_invalid_json", "Missing body")
+        return {
+            "request_id": request_id,
+            "task": "tts",
+            "target": target_alias,
+            "model": target_cfg["tts_model"],
+            "latency_ms": dt_ms,
+            "result": body,
+        }
+
+    media_type = resp.headers.get("content-type", "application/octet-stream")
+    return Response(
+        content=resp.content,
+        media_type=media_type,
+        headers={
+            "X-Request-Id": request_id,
+            "X-VLLM-Target": target_alias,
+            "X-VLLM-Model": target_cfg["tts_model"],
+        },
+    )

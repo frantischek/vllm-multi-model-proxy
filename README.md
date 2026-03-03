@@ -1,15 +1,16 @@
 # vLLM Multi-Model Proxy
 
-A lightweight FastAPI proxy that accepts an uploaded image, resizes it safely,
-forwards it to a vLLM vision model, and returns a single German caption sentence.
+A lightweight FastAPI proxy for multiple vLLM targets and multiple task types:
+image captioning, chat, image generation, and text-to-speech (TTS).
 
-The service is designed for internal usage (`/internal/caption`) and can be hosted
+The service is designed for internal usage (`/internal/*`) and can be hosted
 publicly on GitHub for collaborative improvements.
 
 ## Features
 
 - Token-protected internal endpoint
 - Multi-target routing for multiple vLLM model backends
+- Multi-task API: caption, chat, image generation, and TTS
 - Strict upload limits and MIME type validation
 - Image resize pipeline for stable vLLM input
 - Structured JSON error responses with `request_id`
@@ -18,12 +19,11 @@ publicly on GitHub for collaborative improvements.
 
 ## Architecture
 
-1. Client uploads an image to `POST /internal/caption`
-2. Proxy validates token and input
-3. Proxy resizes image and stores it as temporary JPEG
-4. vLLM fetches image from `GET /_img/{rid}.jpg`
-5. Proxy returns model caption and metadata
-6. Temporary file is deleted
+1. Client calls a task endpoint under `/internal/*`
+2. Proxy validates token, target alias, and payload
+3. For captioning, proxy resizes image and serves it via `/_img/{rid}.jpg`
+4. Proxy forwards to the configured upstream URL for the selected task
+5. Proxy returns structured result and metadata
 
 ## Quickstart
 
@@ -49,7 +49,8 @@ cp .env.example .env
 Set at least:
 
 - `INTERNAL_TOKEN`
-- `VLLM_URL` (single-target mode) or `VLLM_TARGETS_JSON` (multi-target mode)
+- `VLLM_CHAT_URL`/`VLLM_CHAT_MODEL` (single-target mode)
+  or `VLLM_TARGETS_JSON` (multi-target mode)
 - `PROXY_PUBLIC_BASE`
 
 ### 4) Run service
@@ -86,6 +87,49 @@ curl -sS -X POST "http://127.0.0.1:9000/internal/caption" \
   -F "image=@example.jpg"
 ```
 
+### `POST /internal/chat`
+
+Headers:
+
+- `x-internal-token: <INTERNAL_TOKEN>`
+- `x-vllm-target: <optional target alias>`
+
+Body:
+
+- `messages`: OpenAI-style chat messages
+- `target`: optional alias (overrides header)
+
+Example:
+
+```bash
+curl -sS -X POST "http://127.0.0.1:9000/internal/chat" \
+  -H "content-type: application/json" \
+  -H "x-internal-token: dev-token" \
+  -d '{
+    "messages":[{"role":"user","content":"Schreibe einen kurzen Gruß."}],
+    "target":"default"
+  }'
+```
+
+### `POST /internal/image-generate`
+
+Body:
+
+- `prompt`: required
+- optional: `n`, `size`, `quality`, `response_format`, `target`
+
+### `POST /internal/tts`
+
+Body:
+
+- `input`: required text
+- optional: `voice`, `response_format`, `speed`, `target`
+
+Response:
+
+- Audio bytes if upstream returns audio content
+- JSON if upstream returns JSON content
+
 ### `GET /internal/models`
 
 Returns configured model targets (protected by `x-internal-token`).
@@ -100,15 +144,23 @@ Multi-target format example:
 ```json
 {
   "default": {
-    "url": "http://127.0.0.1:8000/v1/chat/completions",
-    "model": "Qwen/Qwen2.5-VL-7B-Instruct"
+    "chat_url": "http://127.0.0.1:8000/v1/chat/completions",
+    "chat_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "caption_model": "Qwen/Qwen2.5-VL-7B-Instruct",
+    "image_url": "http://127.0.0.1:8000/v1/images/generations",
+    "image_model": "Qwen/Qwen-Image",
+    "tts_url": "http://127.0.0.1:8000/v1/audio/speech",
+    "tts_model": "Qwen/Qwen-TTS"
   },
   "fast": {
-    "url": "http://127.0.0.1:8001/v1/chat/completions",
-    "model": "Qwen/Qwen2.5-VL-3B-Instruct"
+    "chat_url": "http://127.0.0.1:8001/v1/chat/completions",
+    "chat_model": "Qwen/Qwen2.5-VL-3B-Instruct"
   }
 }
 ```
+
+Legacy mode is still supported (`url` + `model`), mapped internally to
+`chat_url` + `chat_model`.
 
 ## Security Notes
 
